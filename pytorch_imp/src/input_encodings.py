@@ -2,12 +2,10 @@ import warnings
 import torch
 import torch.nn as nn
 from typing import List
-import os
-import sys
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+
 from base.base_input_encoding import BaseInputEncoding
-from enumerations import CategoricalFormat
+from src.enumerations import CategoricalFormat
+
 from enum import Enum
 
 class NoInputEncoder(BaseInputEncoding):

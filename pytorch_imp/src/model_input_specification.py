@@ -1,7 +1,7 @@
 #  FlowTransformer 2023 by liamdm / liam@riftcs.com
 from typing import List
 
-from enumerations import CategoricalFormat
+from src.enumerations import CategoricalFormat
 
 
 class ModelInputSpecification:

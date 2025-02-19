@@ -90,8 +90,7 @@ class TransformerDecoderBlock(nn.Module):
     
 class Transformer(nn.Module):
     def __init__(self, 
-                 src_vocab_size, 
-                 tgt_vocab_size, 
+                 input_dim, 
                  embed_size, 
                  num_layers, 
                  heads, 
@@ -100,8 +99,8 @@ class Transformer(nn.Module):
                  max_length=512):
         super(Transformer, self).__init__()
 
-        self.src_word_embedding = nn.Embedding(src_vocab_size, embed_size)
-        self.tgt_word_embedding = nn.Embedding(tgt_vocab_size, embed_size)
+        self.src_word_embedding = nn.Linear(input_dim, embed_size)
+        self.tgt_word_embedding = nn.Linear(input_dim, embed_size)
         self.position_embedding = nn.Embedding(max_length, embed_size)
 
         self.encoder_blocks = nn.ModuleList(
@@ -111,7 +110,7 @@ class Transformer(nn.Module):
             [TransformerDecoderBlock(embed_size, heads, dropout, forward_expansion) for _ in range(num_layers)]
         )
 
-        self.fc_out = nn.Linear(embed_size, tgt_vocab_size)
+        self.fc_out = nn.Linear(embed_size, input_dim)
         self.dropout = nn.Dropout(dropout)
         self.max_length = max_length
 

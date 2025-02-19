@@ -2,7 +2,7 @@
 import warnings
 from typing import Optional, Tuple
 
-from model_input_specification import ModelInputSpecification
+from src.model_input_specification import ModelInputSpecification
 
 
 class Component():

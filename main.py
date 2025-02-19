@@ -3,7 +3,7 @@
 import os
 
 import pandas as pd
-
+import pdb
 from framework.dataset_specification import NamedDatasetSpecifications
 from framework.enumerations import EvaluationDatasetSampling
 from framework.flow_transformer import FlowTransformer
@@ -41,9 +41,9 @@ transformers: List[FunctionalComponent] = [
 ]
 
 flow_file_path = r"C:\Data\UQ\NIDS\Collected"
-
+# os.path.join(flow_file_path, "NF-CSE-CIC-IDS2018-v2.csv")
 datasets = [
-    ("CSE_CIC_IDS", os.path.join(flow_file_path, "NF-CSE-CIC-IDS2018-v2.csv"), NamedDatasetSpecifications.unified_flow_format, 0.01, EvaluationDatasetSampling.LastRows),
+    ("CSE_CIC_IDS", '/home/shaoyangguang/d2l/FlowTransformer_Pytorch_Imp/datasets.csv', NamedDatasetSpecifications.unified_flow_format, 0.01, EvaluationDatasetSampling.LastRows),
     ("NSL-KDD", os.path.join(flow_file_path, "NSL-KDD.csv"), NamedDatasetSpecifications.nsl_kdd, 0.05, EvaluationDatasetSampling.RandomRows),
     ("UNSW_NB15", os.path.join(flow_file_path, "NF-UNSW-NB15-v2.csv"), NamedDatasetSpecifications.unified_flow_format, 0.025, EvaluationDatasetSampling.LastRows)
 ]
@@ -59,6 +59,7 @@ ft = FlowTransformer(pre_processing=pre_processing,
 
 # Load the specific dataset
 dataset_name, dataset_path, dataset_specification, eval_percent, eval_method = datasets[0]
+pdb.set_trace()
 ft.load_dataset(dataset_name, dataset_path, dataset_specification, evaluation_dataset_sampling=eval_method, evaluation_percent=eval_percent)
 
 # Build the transformer model

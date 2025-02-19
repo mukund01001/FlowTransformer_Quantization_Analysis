@@ -5,11 +5,11 @@ import pandas as pd
 import os
 import sys
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.append(project_root)
+# project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# sys.path.append(project_root)
 
 from base.base_preprocessing import BasePreProcessing
-from enumerations import CategoricalFormat
+from src.enumerations import CategoricalFormat
 
 
 class StandardPreProcessing(BasePreProcessing):

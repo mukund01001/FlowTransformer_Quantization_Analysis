@@ -59,12 +59,12 @@ class FlowTransformer:
 
         if self.X is None:
             raise Exception("Please call load_dataset before calling build_model()")
-
+        
         m_inputs = []
         for numeric_feature in self.model_input_spec.numeric_feature_names:
             m_input = Input((self.parameters.window_size, 1), name=f"{prefix}input_{numeric_feature}", dtype="float32")
             m_inputs.append(m_input)
-
+        pdb.set_trace()
         for categorical_feature_name, categorical_feature_levels in \
             zip(self.model_input_spec.categorical_feature_names, self.model_input_spec.levels_per_categorical_feature):
             m_input = Input(
@@ -73,7 +73,7 @@ class FlowTransformer:
                 dtype="int32" if self.model_input_spec.categorical_format == CategoricalFormat.Integers else "float32"
             )
             m_inputs.append(m_input)
-
+        pdb.set_trace()
         self.input_encoding.build(self.parameters.window_size, self.model_input_spec)
         self.sequential_model.build(self.parameters.window_size, self.model_input_spec)
         self.classification_head.build(self.parameters.window_size, self.model_input_spec)
@@ -237,7 +237,7 @@ class FlowTransformer:
 
             self.pre_processing.fit_categorical(col_name, training_data)
             new_values = self.pre_processing.transform_categorical(col_name, all_data, self.input_encoding.required_input_format)
-            pdb.set_trace()
+            # pdb.set_trace()
             if self.input_encoding.required_input_format == CategoricalFormat.OneHot:
                 # multiple columns of one hot values
                 if isinstance(new_values, pd.DataFrame):
@@ -255,7 +255,7 @@ class FlowTransformer:
                 new_df[col_name] = new_values
 
         print(f"Generating pre-processed dataframe...")
-        pdb.set_trace()
+        # pdb.set_trace()
         new_df = pd.DataFrame(new_df)
         model_input_spec = ModelInputSpecification(new_features, len(numerical_columns), levels_per_categorical_feature, self.input_encoding.required_input_format)
 
@@ -312,6 +312,7 @@ class FlowTransformer:
         self.model_input_spec = model_input_spec
 
         return df
+
 
     def evaluate(self, m:keras.Model, batch_size, early_stopping_patience:int=5, epochs:int=100, steps_per_epoch:int=128):
         n_malicious_per_batch = int(0.5 * batch_size)

@@ -1,215 +1,241 @@
-import os
-import warnings
-import pandas as pd
 import numpy as np
+import pandas as pd
 
-from typing import Union, Optional, Tuple, List
-from model_input_specification import ModelInputSpecification
-from utils import get_identifier, save_feather_plus_metadata, load_feather_plus_metadata
-from enumerations import EvaluationDatasetSampling, CategoricalFormat
+import torch
+from torch.utils.data import Dataset, DataLoader, Sampler
 
-class DatasetLoader:
-    def __init__(self, pre_processing, input_encoding, rs, retain_inmem_cache=False, inmem_cache=None):
+from src.model_input_specification import ModelInputSpecification
+from src.dataset_specification import DatasetSpecification, NamedDatasetSpecifications
+from src.preprocess import StandardPreProcessing
+from src.enumerations import CategoricalFormat  # 确保导入 CategoricalFormat
+from src.preprocess import StandardPreProcessing  # 导入 StandardPreProcessing
+from src.input_encodings import NoInputEncoder  # 导入 NoInputEncoder
+from src.enumerations import EvaluationDatasetSampling
+
+import pdb
+
+class WindowedSampler(Sampler):
+    def __init__(self, data_source, window_size):
         """
-        初始化 DatasetLoader 类实例
-
-        :param pre_processing: 数据预处理器
-        :param input_encoding: 输入编码处理器
-        :param rs: 随机数生成器
-        :param retain_inmem_cache: 是否保留内存中的缓存
-        :param inmem_cache: 内存缓存
+        :param data_source: 数据集
+        :param window_size: 滑动窗口大小
         """
+        self.data_source = data_source
+        self.window_size = window_size
+        self.total_samples = len(data_source)
+
+    def __iter__(self):
+        """
+        返回按 window_size 步长递增的索引
+        """
+        idx = 0
+        while idx + self.window_size <= self.total_samples:
+            yield idx
+            idx += self.window_size
+        
+        # # 如果剩余数据不足以填充一个窗口，则返回最后一个窗口的起始索引
+        # if idx + self.window_size <= self.total_samples:
+        #     yield idx
+
+    def __len__(self):
+        # 返回可以生成的总批次数
+        # return (self.total_samples // self.window_size) + (1 if self.total_samples % self.window_size != 0 else 0)
+        return self.total_samples // self.window_size
+
+
+
+
+class CustomDataset(Dataset):
+    def __init__(self, dataset: pd.DataFrame, specification, pre_processing, input_encoding, window_size=8):
+        """
+        初始化数据集
+        """
+        # 创建数据集的副本以避免修改原始数据
+        self.dataset = dataset
+        self.specification = specification
         self.pre_processing = pre_processing
         self.input_encoding = input_encoding
-        self.rs = rs if rs is not None else np.random.RandomState()
-        self.retain_inmem_cache = retain_inmem_cache
-        self.inmem_cache = inmem_cache if retain_inmem_cache else None
-        self.dataset_specification = None
-        self.X = None
-        self.y = None
-        self.training_mask = None
+        self.window_size = window_size    
+        self.numerical_filter = 1_000_000_000
+        self.new_df = {}
+        self.new_features = []
         self.model_input_spec = None
 
-    def _load_preprocessed_dataset(self, dataset_name: str,
-                                   dataset: Union[pd.DataFrame, str],
-                                   specification,  # Assume DatasetSpecification type
-                                   cache_folder: Optional[str] = None,
-                                   n_rows: int = 0,
-                                   evaluation_dataset_sampling=None,  # Assume EvaluationDatasetSampling type
-                                   evaluation_percent: float = 0.2,
-                                   numerical_filter: int = 1_000_000_000) -> Tuple[pd.DataFrame, 'ModelInputSpecification']:
-        """
-        内部方法：加载和预处理数据集
+        # 获取需要处理的列
+        self.numerical_columns = set(specification.include_fields).difference(specification.categorical_fields)
+        self.categorical_columns = specification.categorical_fields
+        
+        # 对数据进行预处理
+        self.preprocess_data()
 
-        :param dataset_name: 数据集名称
-        :param dataset: 数据集，可以是 DataFrame 或路径
-        :param specification: 数据集的规格说明
-        :param cache_folder: 缓存目录
-        :param n_rows: 数据集的行数
+    def preprocess_data(self):
+        """ 预处理数据，标准化数值列、编码分类列 """
+        # 数值列标准化
+        for col_name in self.numerical_columns:
+            assert col_name in self.dataset.columns
+            # self.dataset.loc[col_name] = self.dataset[col_name]# .astype("float64")
+            self.new_features.append(col_name)
+            
+            # 获取列值并进行预处理
+            col_values = self.dataset.loc[:, col_name].values
+            col_values[~np.isfinite(col_values)] = 0
+            col_values[col_values < -self.numerical_filter] = 0
+            col_values[col_values > self.numerical_filter] = 0
+            # if == Nan -> set 0
+            col_values[np.isnan(col_values)] = 0
+            
+            # 使用 StandardPreProcessing 对数值列进行预处理
+            self.pre_processing.fit_numerical(col_name, col_values)
+            col_values = self.pre_processing.transform_numerical(col_name, col_values)
+            # self.dataset.loc[:, col_name] = col_values#.astype("float32")4
+            self.new_df[col_name] = col_values
+        
+        # 分类列编码
+        # pdb.set_trace()
+        levels_per_categorical_feature = []
+        for col_name in self.categorical_columns:
+            if col_name == self.specification.class_column:
+                continue
+            # 使用 StandardPreProcessing 对分类列进行预处理
+            self.new_features.append(col_name)
+            col_values = self.dataset[col_name].values
+            # if nan
+            col_values[np.isnan(col_values)] = 0
+            self.pre_processing.fit_categorical(col_name, col_values)
+            new_values = self.pre_processing.transform_categorical(col_name, col_values, self.input_encoding.required_input_format)
+            
+            print(f"Encoding for {col_name}, new_values shape: {new_values.shape}, original data shape: {self.dataset.shape}")
+            # pdb.set_trace()
+            if self.input_encoding.required_input_format == CategoricalFormat.OneHot:
+                # pdb.set_trace()
+                # 对于 OneHot 编码，添加多个列
+                if isinstance(new_values, pd.DataFrame):
+                    # 如果是 DataFrame，则直接逐列添加到原始数据
+                    levels_per_categorical_feature.append(len(new_values.columns))
+                    for c in new_values.columns:
+                        self.new_df[c] = new_values[c]
+                else:
+                    # 如果是 ndarray，则为每个类别创建新列
+                    n_one_hot_levels = new_values.shape[1]
+                    levels_per_categorical_feature.append(n_one_hot_levels)
+                    for z in range(n_one_hot_levels):
+                        new_col_name = f"{col_name}_{z}"
+                        self.new_df[new_col_name] = new_values[:, z]
+            else:
+                # 对于整数编码
+                if len(new_values) == len(self.dataset):  # 确保长度匹配
+                    self.new_df[col_name] = new_values
+                    levels_per_categorical_feature.append(len(np.unique(new_values)))
+                else:
+                    print(f"Warning: Length mismatch for column {col_name}. Expected {len(self.dataset)} but got {len(new_values)}.")
+        
+        self.new_df = pd.DataFrame(self.new_df)
+        self.model_input_spec = ModelInputSpecification(self.new_features, len(self.numerical_columns), levels_per_categorical_feature, self.input_encoding.required_input_format)
+        # pdb.set_trace()
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, idx):
+        # 获取窗口的数据
+        start_idx = idx
+        end_idx = min(len(self.dataset), idx + self.window_size)
+
+        # 获取特征数据
+        x = self.new_df.iloc[start_idx:end_idx].values
+        # print(f"x.shape: {x.shape}")  # 打印 x 的形状
+        
+        # 获取标签数据
+        y_window = self.dataset[self.specification.class_column].iloc[start_idx:end_idx].values
+        y = np.where(y_window == str(self.specification.benign_label), 0, 1)
+        # print("idx: ", idx)
+
+        # 转换为tensor
+        x = torch.tensor(x, dtype=torch.float32)
+        x = x.squeeze(0) # [1, flow_num, dim] -> [flow_num, dim]
+        x = x.unsqueeze(1) # [flow_num, dim] -> [flow_num, 1, dim] => [batch_size, seq_len, input_size]
+        y = torch.tensor(y, dtype=torch.float32)
+        y = y.squeeze(0) # [1, flow_num] -> [flow_num]
+
+        return x, y
+
+class DatasetLoader:
+    def __init__(self, dataset: pd.DataFrame, specification, pre_processing, input_encoding, evaluation_dataset_sampling, evaluation_percent=0.2, batch_size=1, num_workers=1, window_size=8):
+        """
+        初始化 DatasetLoader 类
+
+        :param dataset: 预加载的数据集
+        :param specification: 数据集规格
+        :param pre_processing: 预处理器
+        :param input_encoding: 输入编码
         :param evaluation_dataset_sampling: 评估数据集采样策略
         :param evaluation_percent: 评估数据集的百分比
-        :param numerical_filter: 数值过滤器
-        :return: 处理后的数据集和模型输入规格
+        :param batch_size: 批量大小
+        :param num_workers: 工作线程数
         """
-        cache_file_path = None
+        self.dataset = dataset
+        self.specification = specification
+        self.pre_processing = pre_processing
+        self.input_encoding = input_encoding
+        self.evaluation_dataset_sampling = evaluation_dataset_sampling
+        self.evaluation_percent = evaluation_percent
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.window_size = window_size
 
-        if dataset_name is None:
-            raise Exception("Dataset name must be specified so FlowTransformer can optimise operations between subsequent calls!")
+        # 切分训练集和评估集
+        self.train_dataset, self.eval_dataset = self.split_dataset()
 
-        pp_key = get_identifier({
-            "__preprocessing_name": self.pre_processing.name,
-            **self.pre_processing.parameters
-        })
-
-        local_key = get_identifier({
-            "evaluation_percent": evaluation_percent,
-            "numerical_filter": numerical_filter,
-            "categorical_method": str(self.input_encoding.required_input_format),
-            "n_rows": n_rows,
-        })
-
-        cache_key = f"{dataset_name}_{n_rows}_{pp_key}_{local_key}"
-
-        if self.retain_inmem_cache:
-            if self.inmem_cache is not None and cache_key in self.inmem_cache:
-                print("Using in-memory cached version of this pre-processed dataset.")
-                return self.inmem_cache[cache_key]
-
-        if cache_folder is not None:
-            cache_file_name = f"{cache_key}.feather"
-            cache_file_path = os.path.join(cache_folder, cache_file_name)
-
-            print(f"Using cache file path: {cache_file_path}")
-
-            if os.path.exists(cache_file_path):
-                print(f"Reading directly from cache {cache_file_path}...")
-                return load_feather_plus_metadata(cache_file_path)
-
-        if isinstance(dataset, str):
-            print(f"Attempting to read dataset from path {dataset}...")
-            if dataset.lower().endswith(".feather"):
-                dataset = pd.read_feather(dataset, columns=specification.include_fields + [specification.class_column])
-            elif dataset.lower().endswith(".csv"):
-                dataset = pd.read_csv(dataset, nrows=n_rows if n_rows > 0 else None)
-            else:
-                raise Exception("Unrecognised dataset filetype!")
-        elif not isinstance(dataset, pd.DataFrame):
-            raise Exception("Unrecognised dataset input type, should be a path to a CSV or feather file, or a pandas dataframe!")
-
-        assert isinstance(dataset, pd.DataFrame)
-
-        if 0 < n_rows < len(dataset):
-            dataset = dataset.iloc[:n_rows]
-
-        training_mask = np.ones(len(dataset), dtype=bool)
-        eval_n = int(len(dataset) * evaluation_percent)
-
-        # Handle evaluation dataset sampling logic
-        if evaluation_dataset_sampling == EvaluationDatasetSampling.LastRows:
-            training_mask[-eval_n:] = False
-        elif evaluation_dataset_sampling == EvaluationDatasetSampling.RandomRows:
-            index = np.arange(self.parameters.window_size, len(dataset))
-            sample = self.rs.choice(index, eval_n, replace=False)
-            training_mask[sample] = False
-        elif evaluation_dataset_sampling == EvaluationDatasetSampling.FilterColumn:
-            training_column = dataset.columns[-1]
-            print(f"Using the last column {training_column} as the training mask column")
-            v, c = np.unique(dataset[training_column].values, return_counts=True)
-            min_index = np.argmin(c)
-            min_v = v[min_index]
-            eval_indices = np.argwhere(dataset[training_column].values == min_v).reshape(-1)
-            eval_indices = eval_indices[(eval_indices > self.parameters.window_size)]
-            training_mask[eval_indices] = False
-            del dataset[training_column]
-
-        # Process numerical columns
-        numerical_columns = set(specification.include_fields).difference(specification.categorical_fields)
-        categorical_columns = specification.categorical_fields
-        new_df = {"__training": training_mask, "__y": dataset[specification.class_column].values}
-
-        print("Converting numerical columns to floats and removing out of range values...")
-        for col_name in numerical_columns:
-            assert col_name in dataset.columns
-            col_values = dataset[col_name].values
-            col_values[~np.isfinite(col_values)] = 0
-            col_values[col_values < -numerical_filter] = 0
-            col_values[col_values > numerical_filter] = 0
-            new_df[col_name] = col_values.astype("float32")
-
-        print(f"Applying pre-processing to numerical values")
-        for i, col_name in enumerate(numerical_columns):
-            all_data = new_df[col_name]
-            training_data = all_data[training_mask]
-            self.pre_processing.fit_numerical(col_name, training_data)
-            new_df[col_name] = self.pre_processing.transform_numerical(col_name, all_data)
-
-        print(f"Applying pre-processing to categorical values")
-        levels_per_categorical_feature = []
-        new_features = []
+    def split_dataset(self):
+        """ 根据评估集比例切分数据集 """
+        # pdb.set_trace()
+        eval_n = int(len(self.dataset) * self.evaluation_percent)
+        if self.evaluation_dataset_sampling == EvaluationDatasetSampling.LastRows:
+            # 取数据集最后 eval_n 行作为评估集
+            eval_dataset = self.dataset[-eval_n:]
+            train_dataset = self.dataset[:-eval_n]
+        elif self.evaluation_dataset_sampling == EvaluationDatasetSampling.RandomRows:
+            # 随机抽取 eval_n 行作为评估集
+            index = np.arange(len(self.dataset))
+            sample = np.random.choice(index, eval_n, replace=False)
+            eval_dataset = self.dataset.iloc[sample]
+            train_dataset = self.dataset.drop(sample)
         
-        for i, col_name in enumerate(categorical_columns):
-            new_features.append(col_name)
-            if col_name == specification.class_column:
-                continue
-            all_data = dataset[col_name].values
-            training_data = all_data[training_mask]
-            self.pre_processing.fit_categorical(col_name, training_data)
-            new_values = self.pre_processing.transform_categorical(col_name, all_data, self.input_encoding.required_input_format)
+        return train_dataset, eval_dataset
 
-            if self.input_encoding.required_input_format == CategoricalFormat.OneHot:
-                if isinstance(new_values, pd.DataFrame):
-                    for c in new_values.columns:
-                        new_df[c] = new_values[c]
-                else:
-                    for z in range(new_values.shape[1]):
-                        new_df[f"{col_name}_{z}"] = new_values[:, z]
-            else:
-                new_df[col_name] = new_values
+    def load_data(self):
+        """ 加载训练和评估数据集并返回 DataLoader """
+        # 加载训练集 DataLoader
+        train_custom_dataset = CustomDataset(self.train_dataset, self.specification, self.pre_processing, self.input_encoding)
+        train_sampler = WindowedSampler(train_custom_dataset, window_size=self.window_size)
+        train_loader = DataLoader(train_custom_dataset, batch_size=1, shuffle=False, sampler=train_sampler, num_workers=self.num_workers)
+        
+        # 加载评估集 DataLoader
+        eval_custom_dataset = CustomDataset(self.eval_dataset, self.specification, self.pre_processing, self.input_encoding)
+        eval_sampler = WindowedSampler(eval_custom_dataset, window_size=self.window_size)
+        eval_loader = DataLoader(eval_custom_dataset, batch_size=1, shuffle=False, sampler=eval_sampler, num_workers=self.num_workers)
 
-        new_df = pd.DataFrame(new_df)
-        model_input_spec = ModelInputSpecification(new_features, len(numerical_columns), levels_per_categorical_feature, self.input_encoding.required_input_format)
+        # eval_loader = DataLoader(eval_custom_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        
+        return train_loader, eval_loader
 
-        if cache_file_path is not None:
-            print(f"Writing to cache file path: {cache_file_path}...")
-            save_feather_plus_metadata(cache_file_path, new_df, model_input_spec)
+if __name__ == "__main__":
+    # 假设你有一个数据集和规格说明
+    dataset = pd.read_csv('../datasets.csv')  # 替换为实际路径
+    specification = NamedDatasetSpecifications.unified_flow_format
 
-        if self.retain_inmem_cache:
-            if self.inmem_cache is None:
-                self.inmem_cache = {}
-            self.inmem_cache[cache_key] = (new_df, model_input_spec)
+    # preprocess method
+    pre_processing = StandardPreProcessing(n_categorical_levels=32)
+    # 使用 DatasetLoader 加载数据
+    dataset_loader = DatasetLoader(dataset, specification, pre_processing=pre_processing, input_encoding=NoInputEncoder(), evaluation_dataset_sampling='LastRows', batch_size=64, num_workers=4)
+    train_loader, eval_loader = dataset_loader.load_data()
 
-        return new_df, model_input_spec
+    # 遍历训练集和评估集的批次
 
-    def load_dataset(self, dataset_name: str,
-                     dataset: Union[pd.DataFrame, str],
-                     specification,  # Assume DatasetSpecification type
-                     cache_path: Optional[str] = None,
-                     n_rows: int = 0,
-                     evaluation_dataset_sampling=None,  # Assume EvaluationDatasetSampling type
-                     evaluation_percent: float = 0.2,
-                     numerical_filter: int = 1_000_000_000) -> pd.DataFrame:
-        """
-        加载数据集并为训练做好准备
-        """
-        if cache_path is None:
-            cache_path = "cache"
+    print("Training Data:")
+    for x, y in train_loader:
+        print(x, y)
 
-        if not os.path.exists(cache_path):
-            warnings.warn(f"Could not find cache folder: {cache_path}, attempting to create")
-            os.mkdir(cache_path)
-
-        self.dataset_specification = specification
-        df, model_input_spec = self._load_preprocessed_dataset(dataset_name, dataset, specification, cache_path, n_rows, evaluation_dataset_sampling, evaluation_percent, numerical_filter)
-
-        training_mask = df["__training"].values
-        del df["__training"]
-
-        y = df["__y"].values
-        del df["__y"]
-
-        self.X = df
-        self.y = y
-        self.training_mask = training_mask
-        self.model_input_spec = model_input_spec
-
-        return df
+    print("Evaluation Data:")
+    for x, y in eval_loader:
+        print(x, y)
