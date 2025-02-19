@@ -5,3 +5,5 @@
 /paper_results/results/
 /results/
 /demonstration/
+*txt
+*pycache*

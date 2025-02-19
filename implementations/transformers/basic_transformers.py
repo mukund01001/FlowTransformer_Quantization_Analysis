@@ -1,15 +1,12 @@
-#  FlowTransformer 2023 by liamdm / liam@riftcs.com
+import torch
+import torch.nn as nn
+from transformers import GPT2Model, BertModel, BertConfig
+
 from framework.base_sequential import BaseSequential
 from implementations.transformers.basic.decoder_block import TransformerDecoderBlock
 from implementations.transformers.basic.encoder_block import TransformerEncoderBlock
 
-try:
-    from tensorflow._api.v2.v2 import keras
-except ImportError:
-    from tensorflow import keras
-
 class BasicTransformer(BaseSequential):
-
     @property
     def name(self) -> str:
         if self.use_conv:
@@ -37,18 +34,18 @@ class BasicTransformer(BaseSequential):
         self.dropout_rate = dropout_rate
         self.is_decoder = is_decoder
 
-    def apply(self, X, prefix: str = None):
-        #window_size = self.sequence_length
-        real_size = X.shape[-1]
+        # Define the decoder and encoder blocks using PyTorch equivalents
+        self.decoder_blocks = nn.ModuleList([TransformerDecoderBlock(internal_size, internal_size, n_heads, dropout_rate) for _ in range(n_layers)]) if is_decoder else nn.ModuleList([TransformerEncoderBlock(internal_size, internal_size, n_heads, dropout_rate, use_conv) for _ in range(n_layers)])
+
+    def forward(self, X):
+        real_size = X.size(-1)
 
         m_x = X
 
         for layer_i in range(self.n_layers):
             if self.is_decoder:
-                if self.use_conv:
-                    raise NotImplementedError()
-                m_x = TransformerDecoderBlock(real_size, self.internal_size, self.n_heads, dropout_rate=self.dropout_rate)(m_x)
+                m_x = self.decoder_blocks[layer_i](m_x, m_x)  # Decoder block applies self-attention
             else:
-                m_x = TransformerEncoderBlock(real_size, self.internal_size, self.n_heads, dropout_rate=self.dropout_rate, use_conv=self.use_conv, prefix=f"{prefix}block_{layer_i}_")(m_x)
+                m_x = self.decoder_blocks[layer_i](m_x)  # Encoder block applies self-attention
 
         return m_x

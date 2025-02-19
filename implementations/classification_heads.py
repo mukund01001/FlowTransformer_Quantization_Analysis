@@ -1,23 +1,14 @@
-#  FlowTransformer 2023 by liamdm / liam@riftcs.com
-
+import torch
+import torch.nn as nn
 import numpy as np
-import tensorflow as tf
 
 from framework.base_classification_head import BaseClassificationHead
-
-try:
-    from tensorflow._api.v2.v2 import keras
-except ImportError:
-    from tensorflow import keras
-
-from keras.layers import Dense, Concatenate, Flatten, Lambda, GlobalAveragePooling1D
 
 class FlattenClassificationHead(BaseClassificationHead):
     def apply(self, X, prefix: str = None):
         if prefix is None:
             prefix = ""
-        x = Flatten(name=f"{prefix}flatten")(X)
-        return x
+        return X.view(X.size(0), -1)  # Flatten the tensor
 
     @property
     def name(self) -> str:
@@ -29,43 +20,46 @@ class FlattenClassificationHead(BaseClassificationHead):
 
 
 class FeaturewiseEmbedding(BaseClassificationHead):
-    def __init__(self, project:bool=False):
+    def __init__(self, project: bool = False):
         super().__init__()
         self.project: bool = project
 
     @property
     def name(self):
         if self.project:
-            return f"Featurewise Embed - Projection"
+            return "Featurewise Embed - Projection"
         else:
-            return f"Featurewise Embed - Dense"
+            return "Featurewise Embed - Dense"
 
     @property
     def parameters(self):
         return {}
 
-
-    def apply(self, X, prefix:str=None):
+    def apply(self, X, prefix: str = None):
         if prefix is None:
             prefix = ""
 
         if self.model_input_specification is None:
             raise Exception("Please call build() before calling apply!")
 
-        x = Dense(1,
-                  activation="linear",
-                  use_bias=(not self.project),
-                  name=f"{prefix}featurewise_embed")(X)
+        # Linear layer (Dense) and projection logic
+        linear = nn.Linear(X.size(-1), 1)  # Apply projection to the feature
+        x = linear(X)
 
-        x = Flatten()(x)
+        # Flatten the output to match the original behavior
+        return x.view(x.size(0), -1)
 
-        return x
 
 class GlobalAveragePoolingClassificationHead(BaseClassificationHead):
     def apply(self, X, prefix: str = None):
         if prefix is None:
             prefix = ""
-        return GlobalAveragePooling1D(name=f"{prefix}global_avg_pooling_1d")(X)
+        
+        # Use AdaptiveAvgPool1d for Global Average Pooling
+        pool = nn.AdaptiveAvgPool1d(1)
+        X = X.transpose(1, 2)  # Transpose for pooling: (batch_size, channels, seq_length)
+        return pool(X).squeeze(-1)  # Remove the last dimension (seq_length)
+
 
     @property
     def name(self) -> str:
@@ -84,10 +78,8 @@ class LastTokenClassificationHead(BaseClassificationHead):
         if prefix is None:
             prefix = ""
 
-        x = Lambda(lambda x: x[..., -1, :], name=f"{prefix}slice_last")(X)
-        #x = Flatten(name=f"{prefix}flatten_last")(x)
-
-        return x
+        # Get the last token (i.e., the last element in the sequence dimension)
+        return X[:, -1, :]  # Select the last token along the sequence dimension
 
     @property
     def name(self) -> str:
@@ -99,8 +91,6 @@ class LastTokenClassificationHead(BaseClassificationHead):
 
 
 class CLSTokenClassificationHead(LastTokenClassificationHead):
-
-
     @property
     def name(self) -> str:
         return "CLS Token"
@@ -113,23 +103,20 @@ class CLSTokenClassificationHead(LastTokenClassificationHead):
         if prefix is None:
             prefix = ""
 
-        window_size = self.sequence_length
+        batch_size = X.size(0)
+        window_size = X.size(1)
+        flow_size = X.size(2)
 
-        x = X
-        batch_size = tf.shape(x)[0]
-        flow_size = tf.shape(x)[2]
+        # Create the CLS token and append it to the input tensor (similar to BERT)
+        cls_token = torch.ones(batch_size, 1, flow_size).to(X.device)  # CLS token for batch
 
-        cls_token_horizontal_single = np.zeros((window_size + 1,))
-        cls_token_horizontal_single[-1] = 1.
-        cls_token_horizontal_single = tf.convert_to_tensor(cls_token_horizontal_single, dtype=tf.float32)
+        # Concatenate CLS token vertically
+        X = torch.cat([cls_token, X], dim=1)
 
-        cls_token_horizontal = tf.ones((batch_size, window_size + 1,), dtype=tf.float32)
-        cls_token_horizontal = tf.multiply(cls_token_horizontal, cls_token_horizontal_single)
-        cls_token_horizontal = tf.expand_dims(cls_token_horizontal, axis=-1)
+        # Generate horizontal CLS token for each sequence element
+        cls_token_horizontal = torch.ones(batch_size, window_size + 1, 1).to(X.device)
 
-        cls_token_vertical = tf.zeros((batch_size, 1, flow_size,), dtype=tf.float32)
+        # Concatenate horizontal CLS token
+        X = torch.cat([X, cls_token_horizontal], dim=-1)  # Concatenate in the feature dimension
 
-        x = Concatenate(axis=-2, name=f'{prefix}cls_vertical')([x, cls_token_vertical])
-        x = Concatenate(axis=-1, name=f'{prefix}cls_horizontal')([x, cls_token_horizontal])
-
-        return x
+        return X
