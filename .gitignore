@@ -7,3 +7,5 @@
 /demonstration/
 *txt
 *pycache*
+FlowTransformer/
+*cache*
