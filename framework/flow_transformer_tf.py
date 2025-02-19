@@ -1,17 +1,11 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-
+#  FlowTransformer 2023 by liamdm / liam@riftcs.com
+import os
+import time
+import warnings
 from typing import Optional, Tuple, Union, List
 
 import numpy as np
 import pandas as pd
-import os
-import time
-import warnings
-
-from transformers import AutoModel, AutoTokenizer
-from torch.utils.data import DataLoader, Dataset
 
 from framework.base_classification_head import BaseClassificationHead
 from framework.base_input_encoding import BaseInputEncoding
@@ -23,45 +17,83 @@ from framework.framework_component import FunctionalComponent
 from framework.model_input_specification import ModelInputSpecification
 from framework.utilities import get_identifier, load_feather_plus_metadata, save_feather_plus_metadata
 
+try:
+    from tensorflow._api.v2.v2 import keras
+except ImportError:
+    from tensorflow import keras
 
+from keras import Input, Model
+from keras.layers import Dense, Dropout
 
-class FlowTransformer(nn.Module):
-    def __init__(self, pre_processing: BasePreProcessing,
-                 input_encoding: BaseInputEncoding,
-                 sequential_model: FunctionalComponent,
-                 classification_head: BaseClassificationHead,
-                 params: FlowTransformerParameters):
-        super(FlowTransformer, self).__init__()
-        
+class FlowTransformer:
+    retain_inmem_cache = False
+    inmem_cache = None
+
+    def  __init__(self, pre_processing:BasePreProcessing,
+                  input_encoding:BaseInputEncoding,
+                  sequential_model:FunctionalComponent,
+                  classification_head:BaseClassificationHead,
+                  params:FlowTransformerParameters,
+                  rs:np.random.RandomState=None):
+
+        self.rs = np.random.RandomState() if rs is None else rs
         self.classification_head = classification_head
         self.sequential_model = sequential_model
         self.input_encoding = input_encoding
         self.pre_processing = pre_processing
         self.parameters = params
 
-        self.dataset_specification = None
+        self.dataset_specification: Optional[DatasetSpecification] = None
+
         self.X = None
         self.y = None
+
         self.training_mask = None
-        self.model_input_spec = None
+        self.model_input_spec: Optional[ModelInputSpecification] = None
 
-        # Define your model layers using transformers and PyTorch
-        self.transformer_model = AutoModel.from_pretrained("bert-base-uncased")  # Example, replace with appropriate model
-        self.classification_layers = nn.Sequential(
-            nn.Linear(self.transformer_model.config.hidden_size, 512),
-            nn.ReLU(),
-            nn.Dropout(params.mlp_dropout),
-            nn.Linear(512, 1),
-            nn.Sigmoid()
-        )
+        self.experiment_key = {}
 
-    def forward(self, input_ids, attention_mask=None):
-        # The forward pass of the transformer model
-        transformer_output = self.transformer_model(input_ids=input_ids, attention_mask=attention_mask)
-        output = transformer_output.last_hidden_state  # Or use pooler_output based on your need
-        output = output.mean(dim=1)  # Pooling (simple mean)
-        output = self.classification_layers(output)
-        return output
+    def build_model(self, prefix:str=None):
+        if prefix is None:
+            prefix = ""
+
+        if self.X is None:
+            raise Exception("Please call load_dataset before calling build_model()")
+
+        m_inputs = []
+        for numeric_feature in self.model_input_spec.numeric_feature_names:
+            m_input = Input((self.parameters.window_size, 1), name=f"{prefix}input_{numeric_feature}", dtype="float32")
+            m_inputs.append(m_input)
+
+        for categorical_feature_name, categorical_feature_levels in \
+            zip(self.model_input_spec.categorical_feature_names, self.model_input_spec.levels_per_categorical_feature):
+            m_input = Input(
+                (self.parameters.window_size, 1 if self.model_input_spec.categorical_format == CategoricalFormat.Integers else categorical_feature_levels),
+                name=f"{prefix}input_{categorical_feature_name}",
+                dtype="int32" if self.model_input_spec.categorical_format == CategoricalFormat.Integers else "float32"
+            )
+            m_inputs.append(m_input)
+
+        self.input_encoding.build(self.parameters.window_size, self.model_input_spec)
+        self.sequential_model.build(self.parameters.window_size, self.model_input_spec)
+        self.classification_head.build(self.parameters.window_size, self.model_input_spec)
+
+        m_x = self.input_encoding.apply(m_inputs, prefix)
+
+        # in case the classification head needs to add tokens at this stage
+        m_x = self.classification_head.apply_before_transformer(m_x, prefix)
+
+        m_x = self.sequential_model.apply(m_x, prefix)
+        m_x = self.classification_head.apply(m_x, prefix)
+
+        for layer_i, layer_size in enumerate(self.parameters.mlp_layer_sizes):
+            m_x = Dense(layer_size, activation="relu", name=f"{prefix}classification_mlp_{layer_i}_{layer_size}")(m_x)
+            m_x = Dropout(self.parameters.mlp_dropout)(m_x) if self.parameters.mlp_dropout > 0 else m_x
+
+        m_x = Dense(1, activation="sigmoid", name=f"{prefix}binary_classification_out")(m_x)
+        m = Model(m_inputs, m_x)
+        #m.summary()
+        return m
 
     def _load_preprocessed_dataset(self, dataset_name:str,
                      dataset:Union[pd.DataFrame, str],
@@ -280,7 +312,7 @@ class FlowTransformer(nn.Module):
 
         return df
 
-    def evaluate(self, model: nn.Module, batch_size, early_stopping_patience:int=5, epochs:int=100, steps_per_epoch:int=128):
+    def evaluate(self, m:keras.Model, batch_size, early_stopping_patience:int=5, epochs:int=100, steps_per_epoch:int=128):
         n_malicious_per_batch = int(0.5 * batch_size)
         n_legit_per_batch = batch_size - n_malicious_per_batch
 
@@ -297,20 +329,20 @@ class FlowTransformer(nn.Module):
         malicious_indices_train = np.argwhere(train_mask & y_mask & selectable_mask).reshape(-1)
         legit_indices_train = np.argwhere(train_mask & ~y_mask & selectable_mask).reshape(-1)
 
-        indices_test: np.ndarray = np.argwhere(~train_mask).reshape(-1)
+        indices_test:np.ndarray = np.argwhere(~train_mask).reshape(-1)
 
-        optimizer = optim.Adam(model.parameters(), lr=1e-5)  # You can adjust the learning rate
-        criterion = nn.BCELoss()
-
-        def get_windows_for_indices(indices: np.ndarray, ordered):
+        def get_windows_for_indices(indices:np.ndarray, ordered) -> List[pd.DataFrame]:
             X: List[pd.DataFrame] = []
 
             if ordered:
+                # we don't really want to include eval samples as part of context, because out of range values might be learned
+                # by the model, _but_ we are forced to in the windowed approach, if users haven't just selected the
+                # "take last 10%" as eval option. We warn them prior to this though.
                 for i1 in indices:
                     X.append(self.X.iloc[(i1 - self.parameters.window_size) + 1:i1 + 1])
             else:
                 context_indices_batch = np.random.choice(indices_train, size=(batch_size, self.parameters.window_size),
-                                                        replace=False).reshape(-1)
+                                                         replace=False).reshape(-1)
                 context_indices_batch[:, -1] = indices
 
                 for index in context_indices_batch:
@@ -318,26 +350,29 @@ class FlowTransformer(nn.Module):
 
             return X
 
+        feature_columns_map = {}
+
         def samplewise_to_featurewise(X):
             sequence_length = len(X[0])
 
             combined_df = pd.concat(X)
-            featurewise_X = []
 
-            feature_columns_map = {}
+            featurewise_X = []
 
             if len(feature_columns_map) == 0:
                 for feature in self.model_input_spec.feature_names:
                     if feature in self.model_input_spec.numeric_feature_names or self.model_input_spec.categorical_format == CategoricalFormat.Integers:
                         feature_columns_map[feature] = feature
                     else:
+                        # this is a one-hot encoded categorical feature
                         feature_columns_map[feature] = [c for c in X[0].columns if str(c).startswith(feature)]
 
             for feature in self.model_input_spec.feature_names:
                 feature_columns = feature_columns_map[feature]
                 combined_values = combined_df[feature_columns].values
 
-                combined_values = np.array([combined_values[i:i + sequence_length] for i in range(0, len(combined_values), sequence_length)])
+                # maybe this can be faster with a reshape but I couldn't get it to work
+                combined_values = np.array([combined_values[i:i+sequence_length] for i in range(0, len(combined_values), sequence_length)])
                 featurewise_X.append(combined_values)
 
             return featurewise_X
@@ -359,189 +394,45 @@ class FlowTransformer(nn.Module):
         epoch_results = []
 
         def run_evaluation(epoch):
-            model.eval()  # Switch to evaluation mode
-            with torch.no_grad():  # Disable gradient computation for evaluation
-                pred_y = model(torch.tensor(eval_featurewise_X, dtype=torch.float32))
-                pred_y = pred_y.squeeze().numpy() > 0.5  # Assuming binary classification
+            pred_y = m.predict(eval_featurewise_X, verbose=True)
+            pred_y = pred_y.reshape(-1) > 0.5
 
-                pred_P = pred_y
-                n_pred_P = np.count_nonzero(pred_P)
+            pred_P = pred_y
+            n_pred_P = np.count_nonzero(pred_P)
 
-                pred_N = ~pred_y
-                n_pred_N = np.count_nonzero(pred_N)
+            pred_N = ~pred_y
+            n_pred_N = np.count_nonzero(pred_N)
 
-                TP = np.count_nonzero(pred_P & eval_P)
-                FP = np.count_nonzero(pred_P & ~eval_P)
-                TN = np.count_nonzero(pred_N & eval_N)
-                FN = np.count_nonzero(pred_N & ~eval_N)
+            TP = np.count_nonzero(pred_P & eval_P)
+            FP = np.count_nonzero(pred_P & ~eval_P)
+            TN = np.count_nonzero(pred_N & eval_N)
+            FN = np.count_nonzero(pred_N & ~eval_N)
 
-                sensitivity = TP / (TP + FN) if (TP + FN) > 0 else 0
-                specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
-                balanced_accuracy = (sensitivity + specificity) / 2
+            sensitivity = TP / (TP + FN) if (TP + FN) > 0 else 0
+            specificity = TN / (TN + FP) if (TN + FP) > 0 else 0
+            balanced_accuracy = (sensitivity + specificity) / 2
 
-                precision = TP / (TP + FP) if (TP + FP) > 0 else 0
-                recall = TP / (TP + FN) if (TP + FN) > 0 else 0
+            precision = TP / (TP + FP) if (TP + FP) > 0 else 0
+            recall = TP / (TP + FN) if (TP + FN) > 0 else 0
 
-                f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
-                print(f"Epoch {epoch} yielded predictions: {pred_y.shape}, overall balanced accuracy: {balanced_accuracy * 100:.2f}%, TP = {TP:,} / {n_eval_P:,}, TN = {TN:,} / {n_eval_N:,}")
+            f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+            print(f"Epoch {epoch} yielded predictions: {pred_y.shape}, overall balanced accuracy: {balanced_accuracy * 100:.2f}%, TP = {TP:,} / {n_eval_P:,}, TN = {TN:,} / {n_eval_N:,}")
 
-                epoch_results.append({
-                    "epoch": epoch,
-                    "P": n_eval_P,
-                    "N": n_eval_N,
-                    "pred_P": n_pred_P,
-                    "pred_N": n_pred_N,
-                    "TP": TP,
-                    "FP": FP,
-                    "TN": TN,
-                    "FN": FN,
-                    "bal_acc": balanced_accuracy,
-                    "f1": f1_score
-                })
+            epoch_results.append({
+                "epoch": epoch,
+                "P": n_eval_P,
+                "N": n_eval_N,
+                "pred_P": n_pred_P,
+                "pred_N": n_pred_N,
+                "TP": TP,
+                "FP": FP,
+                "TN": TN,
+                "FN": FN,
+                "bal_acc": balanced_accuracy,
+                "f1": f1_score
+            })
 
-        class BatchYielder():
-            def __init__(self, ordered, random, rs):
-                self.ordered = ordered
-                self.random = random
-                self.cursor_malicious = 0
-                self.cursor_legit = 0
-                self.rs = rs
 
-            def get_batch(self):
-                malicious_indices_batch = self.rs.choice(malicious_indices_train, size=n_malicious_per_batch,
-                                                        replace=False) \
-                    if self.random else \
-                    malicious_indices_train[self.cursor_malicious:self.cursor_malicious + n_malicious_per_batch]
-
-                legitimate_indices_batch = self.rs.choice(legit_indices_train, size=n_legit_per_batch, replace=False) \
-                    if self.random else \
-                    legit_indices_train[self.cursor_legit:self.cursor_legit + n_legit_per_batch]
-
-                indices = np.concatenate([malicious_indices_batch, legitimate_indices_batch])
-
-                self.cursor_malicious = self.cursor_malicious + n_malicious_per_batch
-                self.cursor_malicious = self.cursor_malicious % (len(malicious_indices_train) - n_malicious_per_batch)
-
-                self.cursor_legit = self.cursor_legit + n_legit_per_batch
-                self.cursor_legit = self.cursor_legit % (len(legit_indices_train) - n_legit_per_batch)
-
-                X = get_windows_for_indices(indices, self.ordered)
-                featurewise_X = samplewise_to_featurewise(X)
-
-                return featurewise_X, overall_y_preserve
-
-        batch_yielder = BatchYielder(self.parameters._train_ensure_flows_are_ordered_within_windows,
-                                    not self.parameters._train_draw_sequential_windows, self.rs)
-
-        min_loss = 100
-        iters_since_loss_decrease = 0
-        train_results = []
-        final_epoch = 0
-        last_print = time.time()
-        elapsed_time = 0
-
-        for epoch in range(epochs):
-            final_epoch = epoch
-            has_reduced_loss = False
-            for step in range(steps_per_epoch):
-                batch_X, batch_y = batch_yielder.get_batch()
-
-                t0 = time.time()
-                optimizer.zero_grad()  # Zero the gradients
-                batch_results = model(batch_X)  # Forward pass
-                loss = criterion(batch_results, batch_y)  # Compute loss
-                loss.backward()  # Backward pass
-                optimizer.step()  # Optimization step
-                t1 = time.time()
-
-                elapsed_time += (t1 - t0)
-                train_results.append([loss.item(), elapsed_time, epoch])
-
-                if loss.item() < min_loss:
-                    has_reduced_loss = True
-                    min_loss = loss.item()
-
-            if has_reduced_loss:
-                iters_since_loss_decrease = 0
-            else:
-                iters_since_loss_decrease += 1
-
-            do_early_stop = early_stopping_patience > 0 and iters_since_loss_decrease > early_stopping_patience
-            is_last_epoch = epoch == epochs - 1
-            run_eval = epoch in [6] or is_last_epoch or do_early_stop
-
-            if run_eval:
-                run_evaluation(epoch)
-
-            if do_early_stop:
-                print(f"Early stopping at epoch: {epoch}")
-                break
-
-        eval_results = pd.DataFrame(epoch_results)
-
-        return train_results, eval_results, final_epoch
-
-    def time(self, model: nn.Module, batch_size, n_steps=128, n_repeats=4):
-
-        n_malicious_per_batch = int(0.5 * batch_size)
-        n_legit_per_batch = batch_size - n_malicious_per_batch
-
-        overall_y_preserve = np.zeros(dtype="float32", shape=(n_malicious_per_batch + n_legit_per_batch,))
-        overall_y_preserve[:n_malicious_per_batch] = 1.
-
-        selectable_mask = np.zeros(len(self.X), dtype=bool)
-        selectable_mask[self.parameters.window_size:-self.parameters.window_size] = True
-        train_mask = self.training_mask
-
-        y_mask = ~(self.y.astype('str') == str(self.dataset_specification.benign_label))
-
-        indices_train = np.argwhere(train_mask).reshape(-1)
-        malicious_indices_train = np.argwhere(train_mask & y_mask & selectable_mask).reshape(-1)
-        legit_indices_train = np.argwhere(train_mask & ~y_mask & selectable_mask).reshape(-1)
-
-        indices_test: np.ndarray = np.argwhere(~train_mask).reshape(-1)
-
-        def get_windows_for_indices(indices: np.ndarray, ordered):
-            X: List[pd.DataFrame] = []
-
-            if ordered:
-                for i1 in indices:
-                    X.append(self.X.iloc[(i1 - self.parameters.window_size) + 1:i1 + 1])
-            else:
-                context_indices_batch = np.random.choice(indices_train, size=(batch_size, self.parameters.window_size),
-                                                        replace=False).reshape(-1)
-                context_indices_batch[:, -1] = indices
-
-                for index in context_indices_batch:
-                    X.append(self.X.iloc[index])
-
-            return X
-
-        def samplewise_to_featurewise(X):
-            sequence_length = len(X[0])
-
-            combined_df = pd.concat(X)
-            featurewise_X = []
-
-            feature_columns_map = {}
-
-            if len(feature_columns_map) == 0:
-                for feature in self.model_input_spec.feature_names:
-                    if feature in self.model_input_spec.numeric_feature_names or self.model_input_spec.categorical_format == CategoricalFormat.Integers:
-                        feature_columns_map[feature] = feature
-                    else:
-                        feature_columns_map[feature] = [c for c in X[0].columns if str(c).startswith(feature)]
-
-            for feature in self.model_input_spec.feature_names:
-                feature_columns = feature_columns_map[feature]
-                combined_values = combined_df[feature_columns].values
-
-                combined_values = np.array([combined_values[i:i + sequence_length] for i in range(0, len(combined_values), sequence_length)])
-                featurewise_X.append(combined_values)
-
-            return featurewise_X
-
-        epoch_results = []
         class BatchYielder():
             def __init__(self, ordered, random, rs):
                 self.ordered = ordered
@@ -578,6 +469,173 @@ class FlowTransformer(nn.Module):
                 return featurewise_X, overall_y_preserve
 
         batch_yielder = BatchYielder(self.parameters._train_ensure_flows_are_ordered_within_windows, not self.parameters._train_draw_sequential_windows, self.rs)
+
+        min_loss = 100
+        iters_since_loss_decrease = 0
+
+        train_results = []
+        final_epoch = 0
+
+        last_print = time.time()
+        elapsed_time = 0
+
+        for epoch in range(epochs):
+            final_epoch = epoch
+
+            has_reduced_loss = False
+            for step in range(steps_per_epoch):
+                batch_X, batch_y = batch_yielder.get_batch()
+
+                t0 = time.time()
+                batch_results = m.train_on_batch(batch_X, batch_y)
+                t1 = time.time()
+
+                if epoch > 0 or step > 0:
+                    elapsed_time += (t1 - t0)
+                    if epoch == 0 and step == 1:
+                        # include time for last "step" that we skipped with step > 0 for epoch == 0
+                        elapsed_time *= 2
+
+                train_results.append(batch_results + [elapsed_time, epoch])
+
+                batch_loss = batch_results[0] if isinstance(batch_results, list) else batch_results
+
+                if time.time() - last_print > 3:
+                    last_print = time.time()
+                    early_stop_phrase = "" if early_stopping_patience <= 0 else f" (early stop in {early_stopping_patience - iters_since_loss_decrease:,})"
+                    print(f"Epoch = {epoch:,} / {epochs:,}{early_stop_phrase}, step = {step}, loss = {batch_loss:.5f}, results = {batch_results} -- elapsed (train): {elapsed_time:.2f}s")
+
+                if batch_loss < min_loss:
+                    has_reduced_loss = True
+                    min_loss = batch_loss
+
+            if has_reduced_loss:
+                iters_since_loss_decrease = 0
+            else:
+                iters_since_loss_decrease += 1
+
+            do_early_stop = early_stopping_patience > 0 and iters_since_loss_decrease > early_stopping_patience
+            is_last_epoch = epoch == epochs - 1
+            run_eval = epoch in [6] or is_last_epoch or do_early_stop
+
+            if run_eval:
+                run_evaluation(epoch)
+
+            if do_early_stop:
+                print(f"Early stopping at epoch: {epoch}")
+                break
+
+        eval_results = pd.DataFrame(epoch_results)
+
+        return (train_results, eval_results, final_epoch)
+
+
+    def time(self, m:keras.Model, batch_size, n_steps=128, n_repeats=4):
+        n_malicious_per_batch = int(0.5 * batch_size)
+        n_legit_per_batch = batch_size - n_malicious_per_batch
+
+        overall_y_preserve = np.zeros(dtype="float32", shape=(n_malicious_per_batch + n_legit_per_batch,))
+        overall_y_preserve[:n_malicious_per_batch] = 1.
+
+        selectable_mask = np.zeros(len(self.X), dtype=bool)
+        selectable_mask[self.parameters.window_size:-self.parameters.window_size] = True
+        train_mask = self.training_mask
+
+        y_mask = ~(self.y.astype('str') == str(self.dataset_specification.benign_label))
+
+        indices_train = np.argwhere(train_mask).reshape(-1)
+        malicious_indices_train = np.argwhere(train_mask & y_mask & selectable_mask).reshape(-1)
+        legit_indices_train = np.argwhere(train_mask & ~y_mask & selectable_mask).reshape(-1)
+
+        indices_test:np.ndarray = np.argwhere(~train_mask).reshape(-1)
+
+        def get_windows_for_indices(indices:np.ndarray, ordered) -> List[pd.DataFrame]:
+            X: List[pd.DataFrame] = []
+
+            if ordered:
+                # we don't really want to include eval samples as part of context, because out of range values might be learned
+                # by the model, _but_ we are forced to in the windowed approach, if users haven't just selected the
+                # "take last 10%" as eval option. We warn them prior to this though.
+                for i1 in indices:
+                    X.append(self.X.iloc[(i1 - self.parameters.window_size) + 1:i1 + 1])
+            else:
+                context_indices_batch = np.random.choice(indices_train, size=(batch_size, self.parameters.window_size),
+                                                         replace=False).reshape(-1)
+                context_indices_batch[:, -1] = indices
+
+                for index in context_indices_batch:
+                    X.append(self.X.iloc[index])
+
+            return X
+
+        feature_columns_map = {}
+
+        def samplewise_to_featurewise(X):
+            sequence_length = len(X[0])
+
+            combined_df = pd.concat(X)
+
+            featurewise_X = []
+
+            if len(feature_columns_map) == 0:
+                for feature in self.model_input_spec.feature_names:
+                    if feature in self.model_input_spec.numeric_feature_names or self.model_input_spec.categorical_format == CategoricalFormat.Integers:
+                        feature_columns_map[feature] = feature
+                    else:
+                        # this is a one-hot encoded categorical feature
+                        feature_columns_map[feature] = [c for c in X[0].columns if str(c).startswith(feature)]
+
+            for feature in self.model_input_spec.feature_names:
+                feature_columns = feature_columns_map[feature]
+                combined_values = combined_df[feature_columns].values
+
+                # maybe this can be faster with a reshape but I couldn't get it to work
+                combined_values = np.array([combined_values[i:i+sequence_length] for i in range(0, len(combined_values), sequence_length)])
+                featurewise_X.append(combined_values)
+
+            return featurewise_X
+
+
+        epoch_results = []
+
+
+        class BatchYielder():
+            def __init__(self, ordered, random, rs):
+                self.ordered = ordered
+                self.random = random
+                self.cursor_malicious = 0
+                self.cursor_legit = 0
+                self.rs = rs
+
+            def get_batch(self):
+                malicious_indices_batch = self.rs.choice(malicious_indices_train, size=n_malicious_per_batch,
+                                                         replace=False) \
+                    if self.random else \
+                    malicious_indices_train[self.cursor_malicious:self.cursor_malicious + n_malicious_per_batch]
+
+                legitimate_indices_batch = self.rs.choice(legit_indices_train, size=n_legit_per_batch, replace=False) \
+                    if self.random else \
+                    legit_indices_train[self.cursor_legit:self.cursor_legit + n_legit_per_batch]
+
+                indices = np.concatenate([malicious_indices_batch, legitimate_indices_batch])
+
+                self.cursor_malicious = self.cursor_malicious + n_malicious_per_batch
+                self.cursor_malicious = self.cursor_malicious % (len(malicious_indices_train) - n_malicious_per_batch)
+
+                self.cursor_legit = self.cursor_legit + n_legit_per_batch
+                self.cursor_legit = self.cursor_legit % (len(legit_indices_train) - n_legit_per_batch)
+
+                X = get_windows_for_indices(indices, self.ordered)
+                # each x in X contains a dataframe, with window_size rows and all the features of the flows. There are batch_size of these.
+
+                # we have a dataframe containing batch_size x (window_size, features)
+                # we actually want a result of features x (batch_size, sequence_length, feature_dimension)
+                featurewise_X = samplewise_to_featurewise(X)
+
+                return featurewise_X, overall_y_preserve
+
+        batch_yielder = BatchYielder(self.parameters._train_ensure_flows_are_ordered_within_windows, not self.parameters._train_draw_sequential_windows, self.rs)
+
         min_loss = 100
         iters_since_loss_decrease = 0
 
@@ -595,7 +653,7 @@ class FlowTransformer(nn.Module):
             local_batch_times = []
             for i in range(n_repeats):
                 t0 = time.time()
-                batch_results = model(batch_X)  # Forward pass
+                batch_results = m.predict_on_batch(batch_X)
                 t1 = time.time()
                 local_batch_times.append(t1 - t0)
 
@@ -606,3 +664,5 @@ class FlowTransformer(nn.Module):
                 print(f"Step = {step}, running model evaluation... Average times = {np.mean(np.array(batch_times).reshape(-1))}")
 
         return batch_times
+
+

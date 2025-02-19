@@ -46,6 +46,6 @@ class BasicTransformer(BaseSequential):
             if self.is_decoder:
                 m_x = self.decoder_blocks[layer_i](m_x, m_x)  # Decoder block applies self-attention
             else:
-                m_x = self.decoder_blocks[layer_i](m_x)  # Encoder block applies self-attention
+                m_x = self.encoder_blocks[layer_i](m_x)  # Encoder block applies self-attention
 
         return m_x
