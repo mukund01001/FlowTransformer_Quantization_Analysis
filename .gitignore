@@ -9,3 +9,5 @@
 *pycache*
 FlowTransformer/
 *cache*
+datasets_all.csv
+*demonstration*
