@@ -1,43 +1,54 @@
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, GPT2LMHeadModel
-import torch
-import torch.nn as nn
+try:
+    from tensorflow._api.v2.v2 import keras
+except ImportError:
+    from tensorflow import keras
+#  FlowTransformer 2023 by liamdm / liam@riftcs.com
 
-class TransformerDecoderBlock(nn.Module):
+import tensorflow as tf
+from keras.layers import Dense, Layer, MultiHeadAttention, Dropout, LayerNormalization
+
+class TransformerDecoderBlock(Layer):
     def __init__(self, input_dimension:int, inner_dimension:int, num_heads:int, dropout_rate=0.1):
         super().__init__()
 
-        # Multi-head Attention Layer from Hugging Face's transformers
-        self.multi_head_attention = nn.MultiheadAttention(embed_dim=input_dimension, num_heads=num_heads, dropout=dropout_rate)
-        
-        # Feedforward network
-        self.ffn = nn.Sequential(
-            nn.Linear(input_dimension, inner_dimension),
-            nn.ReLU(),
-            nn.Linear(inner_dimension, input_dimension)
-        )
+        self.num_heads = num_heads
+        self.input_dimension = input_dimension
+        self.inner_dimension = inner_dimension
+        self.dropout_rate = dropout_rate
 
-        # Layer normalization and dropout
-        self.layer_norm1 = nn.LayerNorm(input_dimension)
-        self.layer_norm2 = nn.LayerNorm(input_dimension)
-        self.dropout1 = nn.Dropout(dropout_rate)
-        self.dropout2 = nn.Dropout(dropout_rate)
+        self.mha = MultiHeadAttention(num_heads=num_heads, key_dim=input_dimension)
+        self.dropout1 = Dropout(dropout_rate)
+        self.layernorm1 = LayerNormalization(epsilon=1e-6)
 
-    def forward(self, target_seq, enc_output):
-        # Self-attention of target sequence
-        attn_output, _ = self.multi_head_attention(target_seq, target_seq, target_seq)
-        attn_output = self.dropout1(attn_output)
+        self.ffn = tf.keras.Sequential([
+            Dense(inner_dimension, activation='relu'),
+            Dense(input_dimension)
+        ])
+        self.dropout2 = Dropout(dropout_rate)
+        self.layernorm2 = LayerNormalization(epsilon=1e-6)
+
+    # noinspection PyMethodOverriding
+    def call(self, inputs, training, mask=None):
+        # inputs = (target_seq, enc_output)
+        target_seq = inputs
+        enc_output = inputs
+
+        # self attention of target_seq
+        attn_output = self.mha(target_seq, target_seq)
+        attn_output = self.dropout1(attn_output, training=training)
         out1 = target_seq + attn_output
-        out1 = self.layer_norm1(out1)
+        out1 = self.layernorm1(out1)
 
-        # Cross-attention with encoder output as the key and value
-        attn_output, _ = self.multi_head_attention(out1, enc_output, enc_output)
-        attn_output = self.dropout2(attn_output)
+        # multi-head attention with encoder output as the key and value, and target_seq as the query
+        attn_output = self.mha(out1, enc_output)
+        attn_output = self.dropout2(attn_output, training=training)
         out2 = out1 + attn_output
-        out2 = self.layer_norm2(out2)
+        out2 = self.layernorm2(out2)
 
-        # Feedforward network
+        # feed forward network
         ffn_output = self.ffn(out2)
+        ffn_output = self.dropout2(ffn_output, training=training)
         out3 = out2 + ffn_output
-        out3 = self.layer_norm2(out3)
+        out3 = self.layernorm2(out3)
 
         return out3
