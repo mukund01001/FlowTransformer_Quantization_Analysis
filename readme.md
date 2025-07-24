@@ -2,7 +2,7 @@
 
 ## 🏆 Project Highlight
 
-This research project, developed at the **I2CS Research Lab, Indian Institute of Information Technology, Kottayam**, has been officially selected for presentation at the prestigious **Design and Verification Conference (DVCon) India 2025** 3 OUT OF 12000 applications, 1 year long competetion. This repository contains the complete software model, quantization analysis, and verification framework that serves as the high-level counterpart to our custom-designed hardware accelerator.
+This research project, developed at the **I2CS Research Lab, Indian Institute of Information Technology, Kottayam**, has been officially selected for presentation at the prestigious **Design and Verification Conference (DVCon) India 2025**, 3 OUT OF 12000 applications, 1 year long competetion. This repository contains the complete software model, quantization analysis, and verification framework that serves as the high-level counterpart to our custom-designed hardware accelerator.
 
 ---
 
