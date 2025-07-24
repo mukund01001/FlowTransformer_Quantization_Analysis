@@ -6,7 +6,7 @@ from typing import Optional, Tuple, Union, List
 
 import numpy as np
 import pandas as pd
-import pdb
+
 from framework.base_classification_head import BaseClassificationHead
 from framework.base_input_encoding import BaseInputEncoding
 from framework.base_preprocessing import BasePreProcessing
@@ -17,13 +17,8 @@ from framework.framework_component import FunctionalComponent
 from framework.model_input_specification import ModelInputSpecification
 from framework.utilities import get_identifier, load_feather_plus_metadata, save_feather_plus_metadata
 
-try:
-    from tensorflow._api.v2.v2 import keras
-except ImportError:
-    from tensorflow import keras
-
-from keras import Input, Model
-from keras.layers import Dense, Dropout
+from tensorflow.keras import Input, Model
+from tensorflow.keras.layers import Dense, Dropout
 
 class FlowTransformer:
     retain_inmem_cache = False
@@ -64,7 +59,7 @@ class FlowTransformer:
         for numeric_feature in self.model_input_spec.numeric_feature_names:
             m_input = Input((self.parameters.window_size, 1), name=f"{prefix}input_{numeric_feature}", dtype="float32")
             m_inputs.append(m_input)
-        pdb.set_trace()
+        
         for categorical_feature_name, categorical_feature_levels in \
             zip(self.model_input_spec.categorical_feature_names, self.model_input_spec.levels_per_categorical_feature):
             m_input = Input(
@@ -73,7 +68,7 @@ class FlowTransformer:
                 dtype="int32" if self.model_input_spec.categorical_format == CategoricalFormat.Integers else "float32"
             )
             m_inputs.append(m_input)
-        pdb.set_trace()
+        
         self.input_encoding.build(self.parameters.window_size, self.model_input_spec)
         self.sequential_model.build(self.parameters.window_size, self.model_input_spec)
         self.classification_head.build(self.parameters.window_size, self.model_input_spec)
@@ -314,7 +309,7 @@ class FlowTransformer:
         return df
 
 
-    def evaluate(self, m:keras.Model, batch_size, early_stopping_patience:int=5, epochs:int=100, steps_per_epoch:int=128):
+    def evaluate(self, m:Model, batch_size, early_stopping_patience:int=5, epochs:int=100, steps_per_epoch:int=128):
         n_malicious_per_batch = int(0.5 * batch_size)
         n_legit_per_batch = batch_size - n_malicious_per_batch
 
@@ -531,7 +526,7 @@ class FlowTransformer:
 
         return (train_results, eval_results, final_epoch)
 
-    def time(self, m:keras.Model, batch_size, n_steps=128, n_repeats=4):
+    def time(self, m:Model, batch_size, n_steps=128, n_repeats=4):
         n_malicious_per_batch = int(0.5 * batch_size)
         n_legit_per_batch = batch_size - n_malicious_per_batch
 

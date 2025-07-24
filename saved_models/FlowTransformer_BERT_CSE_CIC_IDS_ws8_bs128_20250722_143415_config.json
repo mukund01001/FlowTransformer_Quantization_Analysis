@@ -1,0 +1,33 @@
+{
+  "model_name": "FlowTransformer_BERT_CSE_CIC_IDS_ws8_bs128_20250722_143415",
+  "timestamp": "20250722_143415",
+  "model_format": "native_keras",
+  "dataset": {
+    "name": "CSE_CIC_IDS",
+    "path": "/home/joeldan/dvcon_model/FlowTransformer_Pytorch_Imp/datasets.csv",
+    "eval_percent": 0.01,
+    "eval_method": "LastRows"
+  },
+  "model_config": {
+    "input_encoding": "NoInputEncoder",
+    "sequential_model": "BasicTransformer",
+    "classification_head": "LastTokenClassificationHead",
+    "window_size": 8,
+    "mlp_layer_sizes": [
+      128
+    ],
+    "mlp_dropout": 0.1
+  },
+  "training_config": {
+    "batch_size": 128,
+    "epochs": 5,
+    "steps_per_epoch": 64,
+    "early_stopping_patience": 5,
+    "final_epoch": 4
+  },
+  "optimizer": "adam",
+  "loss": "binary_crossentropy",
+  "metrics": [
+    "binary_accuracy"
+  ]
+}
